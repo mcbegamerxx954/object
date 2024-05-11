@@ -90,13 +90,53 @@ where
     }
 
     /// Returns the raw ELF file header.
+    #[deprecated(note = "Use `elf_header` instead")]
     pub fn raw_header(&self) -> &'data Elf {
         self.header
     }
 
     /// Returns the raw ELF segments.
+    #[deprecated(note = "Use `elf_program_headers` instead")]
     pub fn raw_segments(&self) -> &'data [Elf::ProgramHeader] {
         self.segments
+    }
+
+    /// Get the raw ELF file header.
+    pub fn elf_header(&self) -> &'data Elf {
+        self.header
+    }
+
+    /// Get the raw ELF program headers.
+    ///
+    /// Returns an empty slice if the file has no program headers.
+    pub fn elf_program_headers(&self) -> &'data [Elf::ProgramHeader] {
+        self.segments
+    }
+
+    /// Get the ELF section table.
+    ///
+    /// Returns an empty section table if the file has no section headers.
+    pub fn elf_section_table(&self) -> &SectionTable<'data, Elf, R> {
+        &self.sections
+    }
+
+    /// Get the ELF symbol table.
+    ///
+    /// Returns an empty symbol table if the file has no symbol table.
+    pub fn elf_symbol_table(&self) -> &SymbolTable<'data, Elf, R> {
+        &self.symbols
+    }
+
+    /// Get the ELF dynamic symbol table.
+    ///
+    /// Returns an empty symbol table if the file has no dynamic symbol table.
+    pub fn elf_dynamic_symbol_table(&self) -> &SymbolTable<'data, Elf, R> {
+        &self.dynamic_symbols
+    }
+
+    /// Get a mapping for linked relocation sections.
+    pub fn elf_relocation_sections(&self) -> &RelocationSections {
+        &self.relocations
     }
 
     fn raw_section_by_name<'file>(
@@ -238,21 +278,15 @@ where
     }
 
     fn sections(&self) -> ElfSectionIterator<'data, '_, Elf, R> {
-        ElfSectionIterator {
-            file: self,
-            iter: self.sections.iter().enumerate(),
-        }
+        ElfSectionIterator::new(self)
     }
 
     fn comdats(&self) -> ElfComdatIterator<'data, '_, Elf, R> {
-        ElfComdatIterator {
-            file: self,
-            iter: self.sections.iter().enumerate(),
-        }
+        ElfComdatIterator::new(self)
     }
 
     fn symbol_by_index(&self, index: SymbolIndex) -> read::Result<ElfSymbol<'data, '_, Elf, R>> {
-        let symbol = self.symbols.symbol(index.0)?;
+        let symbol = self.symbols.symbol(index)?;
         Ok(ElfSymbol {
             endian: self.endian,
             symbols: &self.symbols,
@@ -262,11 +296,7 @@ where
     }
 
     fn symbols(&self) -> ElfSymbolIterator<'data, '_, Elf, R> {
-        ElfSymbolIterator {
-            endian: self.endian,
-            symbols: &self.symbols,
-            index: 0,
-        }
+        ElfSymbolIterator::new(self.endian, &self.symbols)
     }
 
     fn symbol_table(&self) -> Option<ElfSymbolTable<'data, '_, Elf, R>> {
@@ -280,11 +310,7 @@ where
     }
 
     fn dynamic_symbols(&self) -> ElfSymbolIterator<'data, '_, Elf, R> {
-        ElfSymbolIterator {
-            endian: self.endian,
-            symbols: &self.dynamic_symbols,
-            index: 0,
-        }
+        ElfSymbolIterator::new(self.endian, &self.dynamic_symbols)
     }
 
     fn dynamic_symbol_table(&self) -> Option<ElfSymbolTable<'data, '_, Elf, R>> {
@@ -676,6 +702,18 @@ pub trait FileHeader: Debug + Pod {
             .read_error("Invalid ELF section header offset/size/alignment")
     }
 
+    /// Get the section index of the section header string table.
+    ///
+    /// Returns `Err` for invalid values (including if the index is 0).
+    fn section_strings_index<'data, R: ReadRef<'data>>(
+        &self,
+        endian: Self::Endian,
+        data: R,
+    ) -> read::Result<SectionIndex> {
+        self.shstrndx(endian, data)
+            .map(|index| SectionIndex(index as usize))
+    }
+
     /// Return the string table for the section headers.
     fn section_strings<'data, R: ReadRef<'data>>(
         &self,
@@ -686,8 +724,8 @@ pub trait FileHeader: Debug + Pod {
         if sections.is_empty() {
             return Ok(StringTable::default());
         }
-        let index = self.shstrndx(endian, data)? as usize;
-        let shstrtab = sections.get(index).read_error("Invalid ELF e_shstrndx")?;
+        let index = self.section_strings_index(endian, data)?;
+        let shstrtab = sections.get(index.0).read_error("Invalid ELF e_shstrndx")?;
         let strings = if let Some((shstrtab_offset, shstrtab_size)) = shstrtab.file_range(endian) {
             let shstrtab_end = shstrtab_offset
                 .checked_add(shstrtab_size)

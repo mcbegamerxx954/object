@@ -37,9 +37,22 @@ impl<'data, Elf: FileHeader, R: ReadRef<'data>> SectionTable<'data, Elf, R> {
     }
 
     /// Iterate over the section headers.
+    ///
+    /// This includes the null section at index 0, which you will usually need to skip.
     #[inline]
     pub fn iter(&self) -> slice::Iter<'data, Elf::SectionHeader> {
         self.sections.iter()
+    }
+
+    /// Iterate over the section headers and their indices.
+    ///
+    /// This includes the null section at index 0, which you will usually need to skip.
+    #[inline]
+    pub fn enumerate(&self) -> impl Iterator<Item = (SectionIndex, &'data Elf::SectionHeader)> {
+        self.sections
+            .iter()
+            .enumerate()
+            .map(|(i, section)| (SectionIndex(i), section))
     }
 
     /// Return true if the section table is empty.
@@ -54,8 +67,13 @@ impl<'data, Elf: FileHeader, R: ReadRef<'data>> SectionTable<'data, Elf, R> {
         self.sections.len()
     }
 
-    /// Return the section header at the given index.
+    /// Get the section header at the given index.
+    ///
+    /// Returns an error for the null section at index 0.
     pub fn section(&self, index: SectionIndex) -> read::Result<&'data Elf::SectionHeader> {
+        if index == SectionIndex(0) {
+            return Err(read::Error("Invalid ELF section index"));
+        }
         self.sections
             .get(index.0)
             .read_error("Invalid ELF section index")
@@ -79,7 +97,7 @@ impl<'data, Elf: FileHeader, R: ReadRef<'data>> SectionTable<'data, Elf, R> {
     pub fn section_name(
         &self,
         endian: Elf::Endian,
-        section: &'data Elf::SectionHeader,
+        section: &Elf::SectionHeader,
     ) -> read::Result<&'data [u8]> {
         section.name(endian, self.strings)
     }
@@ -338,8 +356,20 @@ where
     Elf: FileHeader,
     R: ReadRef<'data>,
 {
-    pub(super) file: &'file ElfFile<'data, Elf, R>,
-    pub(super) iter: iter::Enumerate<slice::Iter<'data, Elf::SectionHeader>>,
+    file: &'file ElfFile<'data, Elf, R>,
+    iter: iter::Enumerate<slice::Iter<'data, Elf::SectionHeader>>,
+}
+
+impl<'data, 'file, Elf, R> ElfSectionIterator<'data, 'file, Elf, R>
+where
+    Elf: FileHeader,
+    R: ReadRef<'data>,
+{
+    pub(super) fn new(file: &'file ElfFile<'data, Elf, R>) -> Self {
+        let mut iter = file.sections.iter().enumerate();
+        iter.next(); // Skip null section.
+        ElfSectionIterator { file, iter }
+    }
 }
 
 impl<'data, 'file, Elf, R> Iterator for ElfSectionIterator<'data, 'file, Elf, R>
@@ -380,6 +410,73 @@ where
 }
 
 impl<'data, 'file, Elf: FileHeader, R: ReadRef<'data>> ElfSection<'data, 'file, Elf, R> {
+    /// Get the ELF file containing this section.
+    pub fn elf_file(&self) -> &'file ElfFile<'data, Elf, R> {
+        self.file
+    }
+
+    /// Get the raw ELF section header.
+    pub fn elf_section_header(&self) -> &'data Elf::SectionHeader {
+        self.section
+    }
+
+    /// Get the index of the relocation section that references this section.
+    ///
+    /// Returns `None` if there are no relocations.
+    /// Returns an error if there are multiple relocation sections that reference this section.
+    pub fn elf_relocation_section_index(&self) -> read::Result<Option<SectionIndex>> {
+        let Some(relocation_index) = self.file.relocations.get(self.index) else {
+            return Ok(None);
+        };
+        if self.file.relocations.get(relocation_index).is_some() {
+            return Err(Error(
+                "Unsupported ELF section with multiple relocation sections",
+            ));
+        }
+        Ok(Some(relocation_index))
+    }
+
+    /// Get the relocation section that references this section.
+    ///
+    /// Returns `None` if there are no relocations.
+    /// Returns an error if there are multiple relocation sections that reference this section.
+    pub fn elf_relocation_section(&self) -> read::Result<Option<&'data Elf::SectionHeader>> {
+        let Some(relocation_index) = self.elf_relocation_section_index()? else {
+            return Ok(None);
+        };
+        self.file.sections.section(relocation_index).map(Some)
+    }
+
+    /// Get the `Elf::Rel` entries that apply to this section.
+    ///
+    /// Returns an empty slice if there are no relocations.
+    /// Returns an error if there are multiple relocation sections that reference this section.
+    pub fn elf_linked_rel(&self) -> read::Result<&'data [Elf::Rel]> {
+        let Some(relocation_section) = self.elf_relocation_section()? else {
+            return Ok(&[]);
+        };
+        // The linked symbol table was already checked when self.file.relocations was created.
+        let Some((rel, _)) = relocation_section.rel(self.file.endian, self.file.data)? else {
+            return Ok(&[]);
+        };
+        Ok(rel)
+    }
+
+    /// Get the `Elf::Rela` entries that apply to this section.
+    ///
+    /// Returns an empty slice if there are no relocations.
+    /// Returns an error if there are multiple relocation sections that reference this section.
+    pub fn elf_linked_rela(&self) -> read::Result<&'data [Elf::Rela]> {
+        let Some(relocation_section) = self.elf_relocation_section()? else {
+            return Ok(&[]);
+        };
+        // The linked symbol table was already checked when self.file.relocations was created.
+        let Some((rela, _)) = relocation_section.rela(self.file.endian, self.file.data)? else {
+            return Ok(&[]);
+        };
+        Ok(rela)
+    }
+
     fn bytes(&self) -> read::Result<&'data [u8]> {
         self.section
             .data(self.file.endian, self.file.data)
@@ -633,6 +730,26 @@ pub trait SectionHeader: Debug + Pod {
             .read_error("Invalid ELF section name offset")
     }
 
+    /// Get the `sh_link` field as a section index.
+    ///
+    /// This may return a null section index, and does not check for validity.
+    fn link(&self, endian: Self::Endian) -> SectionIndex {
+        SectionIndex(self.sh_link(endian) as usize)
+    }
+
+    /// Return true if the `SHF_INFO_LINK` flag is set.
+    fn has_info_link(&self, endian: Self::Endian) -> bool {
+        self.sh_flags(endian).into() & u64::from(elf::SHF_INFO_LINK) != 0
+    }
+
+    /// Get the `sh_info` field as a section index.
+    ///
+    /// This does not check the `SHF_INFO_LINK` flag.
+    /// This may return a null section index, and does not check for validity.
+    fn info_link(&self, endian: Self::Endian) -> SectionIndex {
+        SectionIndex(self.sh_info(endian) as usize)
+    }
+
     /// Return the offset and size of the section in the file.
     ///
     /// Returns `None` for sections that have no data in the file.
@@ -735,8 +852,7 @@ pub trait SectionHeader: Debug + Pod {
         let rel = self
             .data_as_array(endian, data)
             .read_error("Invalid ELF relocation section offset or size")?;
-        let link = SectionIndex(self.sh_link(endian) as usize);
-        Ok(Some((rel, link)))
+        Ok(Some((rel, self.link(endian))))
     }
 
     /// Return the `Elf::Rela` entries in the section.
@@ -756,8 +872,7 @@ pub trait SectionHeader: Debug + Pod {
         let rela = self
             .data_as_array(endian, data)
             .read_error("Invalid ELF relocation section offset or size")?;
-        let link = SectionIndex(self.sh_link(endian) as usize);
-        Ok(Some((rela, link)))
+        Ok(Some((rela, self.link(endian))))
     }
 
     /// Return entries in a dynamic section.
@@ -777,8 +892,7 @@ pub trait SectionHeader: Debug + Pod {
         let dynamic = self
             .data_as_array(endian, data)
             .read_error("Invalid ELF dynamic section offset or size")?;
-        let link = SectionIndex(self.sh_link(endian) as usize);
-        Ok(Some((dynamic, link)))
+        Ok(Some((dynamic, self.link(endian))))
     }
 
     /// Return a note iterator for the section data.
@@ -861,8 +975,7 @@ pub trait SectionHeader: Debug + Pod {
             .data(endian, data)
             .read_error("Invalid ELF hash section offset or size")?;
         let hash = HashTable::parse(endian, data)?;
-        let link = SectionIndex(self.sh_link(endian) as usize);
-        Ok(Some((hash, link)))
+        Ok(Some((hash, self.link(endian))))
     }
 
     /// Return the header of a GNU hash section.
@@ -904,8 +1017,7 @@ pub trait SectionHeader: Debug + Pod {
             .data(endian, data)
             .read_error("Invalid ELF GNU hash section offset or size")?;
         let hash = GnuHashTable::parse(endian, data)?;
-        let link = SectionIndex(self.sh_link(endian) as usize);
-        Ok(Some((hash, link)))
+        Ok(Some((hash, self.link(endian))))
     }
 
     /// Return the contents of a `SHT_GNU_VERSYM` section.
@@ -925,8 +1037,7 @@ pub trait SectionHeader: Debug + Pod {
         let versym = self
             .data_as_array(endian, data)
             .read_error("Invalid ELF GNU versym section offset or size")?;
-        let link = SectionIndex(self.sh_link(endian) as usize);
-        Ok(Some((versym, link)))
+        Ok(Some((versym, self.link(endian))))
     }
 
     /// Return an iterator for the entries of a `SHT_GNU_VERDEF` section.
@@ -946,8 +1057,10 @@ pub trait SectionHeader: Debug + Pod {
         let verdef = self
             .data(endian, data)
             .read_error("Invalid ELF GNU verdef section offset or size")?;
-        let link = SectionIndex(self.sh_link(endian) as usize);
-        Ok(Some((VerdefIterator::new(endian, verdef), link)))
+        Ok(Some((
+            VerdefIterator::new(endian, verdef),
+            self.link(endian),
+        )))
     }
 
     /// Return an iterator for the entries of a `SHT_GNU_VERNEED` section.
@@ -967,8 +1080,10 @@ pub trait SectionHeader: Debug + Pod {
         let verneed = self
             .data(endian, data)
             .read_error("Invalid ELF GNU verneed section offset or size")?;
-        let link = SectionIndex(self.sh_link(endian) as usize);
-        Ok(Some((VerneedIterator::new(endian, verneed), link)))
+        Ok(Some((
+            VerneedIterator::new(endian, verneed),
+            self.link(endian),
+        )))
     }
 
     /// Return the contents of a `SHT_GNU_ATTRIBUTES` section.

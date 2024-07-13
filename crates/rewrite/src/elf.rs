@@ -876,7 +876,7 @@ fn find_move_sections(
                     blocks[i + 1].name,
                     blocks[i + 1].address,
                 );
-                return Err(Error::modify("Overlapping immovable sections"));
+                //return Err(Error::modify("Overlapping immovable sections"));
             }
             #[cfg(feature = "logging")]
             info!(
